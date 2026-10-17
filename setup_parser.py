@@ -29,14 +29,19 @@ Respond with ONLY minified JSON, no prose, no markdown fences, in this shape:
 If nothing matches reasonably, pick the closest one and lower confidence."""
 
 
+class VisionUnavailable(Exception):
+    """Raised when an image is uploaded but no vision model is configured."""
+    pass
+
+
 class SetupParser:
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY is not set. Add it to your environment variables.")
-        # `or` (not a default arg) so a blank env value still falls back correctly
         self.text_model = os.environ.get("OPENROUTER_TEXT_MODEL") or "openrouter/auto"
-        self.vision_model = os.environ.get("OPENROUTER_VISION_MODEL") or self.text_model
+        # Blank or missing means image analysis is switched off
+        self.vision_model = os.environ.get("OPENROUTER_VISION_MODEL") or None
 
     def _chat(self, model: str, user_content) -> dict:
         resp = httpx.post(
@@ -63,6 +68,8 @@ class SetupParser:
 
     def parse_image(self, image_bytes: bytes, media_type: str = "image/png",
                     extra_text: str | None = None) -> dict:
+        if not self.vision_model:
+            raise VisionUnavailable("No vision model configured")
         b64 = base64.b64encode(image_bytes).decode()
         content = [
             {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}"}},
