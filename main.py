@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
+from typing import Optional
+
 from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
 
 from setup_parser import SetupParser, KNOWN_PATTERNS, VisionUnavailable
 from scanner import scan_pairs, DEFAULT_PAIRS, DEFAULT_TIMEFRAMES
@@ -21,6 +23,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+VALID_TIMEFRAMES = {"15min", "1h", "4h", "1day"}
+
+
+def clean_text(raw: str | None) -> str | None:
+    """Treat blanks and the /docs placeholder 'string' as no input."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw or raw.lower() == "string":
+        return None
+    return raw
+
+
+def clean_pairs(raw: str | None) -> list[str] | None:
+    """Keep only values shaped like EUR/USD; ignore junk such as 'string'."""
+    if not raw:
+        return None
+    valid = [
+        p.strip().upper()
+        for p in raw.split(",")
+        if re.fullmatch(r"[A-Za-z]{3}/[A-Za-z]{3}", p.strip())
+    ]
+    return valid or None
+
+
+def clean_timeframes(raw: str | None) -> list[str] | None:
+    """Keep only supported timeframes; ignore junk."""
+    if not raw:
+        return None
+    valid = [
+        t.strip().lower()
+        for t in raw.split(",")
+        if t.strip().lower() in VALID_TIMEFRAMES
+    ]
+    return valid or None
+
 
 @app.get("/health")
 async def health():
@@ -29,6 +67,7 @@ async def health():
         "known_patterns": KNOWN_PATTERNS,
         "default_pairs": DEFAULT_PAIRS,
         "default_timeframes": DEFAULT_TIMEFRAMES,
+        "valid_timeframes": sorted(VALID_TIMEFRAMES),
     }
 
 
@@ -53,8 +92,8 @@ async def test_data(pair: str = "EUR/USD", interval: str = "1h"):
 async def scan(
     description: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
-    pairs: Optional[str] = Form(None),        # comma separated, e.g. "EUR/USD,GBP/USD"
-    timeframes: Optional[str] = Form(None),   # comma separated, e.g. "1h,4h"
+    pairs: Optional[str] = Form(None),        # e.g. "EUR/USD,GBP/USD"
+    timeframes: Optional[str] = Form(None),   # e.g. "1h,4h"
     min_score: float = Form(40.0),
 ):
     """
@@ -62,7 +101,10 @@ async def scan(
     Returns the pairs/timeframes currently forming or near that setup,
     ranked by how far along the pattern is and by confidence.
     """
-    if not description and not image:
+    description = clean_text(description)
+    has_image = image is not None and bool(image.filename)
+
+    if not description and not has_image:
         raise HTTPException(400, "Provide a text description, an image, or both.")
 
     try:
@@ -71,7 +113,7 @@ async def scan(
         raise HTTPException(500, str(e))
 
     try:
-        if image is not None and image.filename:
+        if has_image:
             image_bytes = await image.read()
             try:
                 parsed = parser.parse_image(
@@ -88,8 +130,6 @@ async def scan(
                         "Image analysis isn't enabled. Describe the setup in text instead.",
                     )
         else:
-            if not description:
-                raise HTTPException(400, "Provide a text description or an image.")
             parsed = parser.parse_text(description)
     except HTTPException:
         raise
@@ -104,12 +144,13 @@ async def scan(
             f"'double bottom' or 'bull flag'. Model said: {parsed.get('notes')}",
         )
 
-    pair_list = [p.strip() for p in pairs.split(",") if p.strip()] if pairs else None
-    tf_list = [t.strip() for t in timeframes.split(",") if t.strip()] if timeframes else None
-
     try:
-        result = await scan_pairs(pattern_key, pairs=pair_list, timeframes=tf_list,
-                                  min_score=min_score)
+        result = await scan_pairs(
+            pattern_key,
+            pairs=clean_pairs(pairs),
+            timeframes=clean_timeframes(timeframes),
+            min_score=min_score,
+        )
     except Exception as e:
         raise HTTPException(502, f"Market data fetch failed: {e}")
 
