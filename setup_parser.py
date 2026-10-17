@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import httpx
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -32,10 +33,10 @@ class SetupParser:
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self.api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is not set. Add it to your .env file.")
-        # Text model can be any chat model; vision model must accept images.
-        self.text_model = os.environ.get("OPENROUTER_TEXT_MODEL", "openrouter/auto")
-        self.vision_model = os.environ.get("OPENROUTER_VISION_MODEL", self.text_model)
+            raise RuntimeError("OPENROUTER_API_KEY is not set. Add it to your environment variables.")
+        # `or` (not a default arg) so a blank env value still falls back correctly
+        self.text_model = os.environ.get("OPENROUTER_TEXT_MODEL") or "openrouter/auto"
+        self.vision_model = os.environ.get("OPENROUTER_VISION_MODEL") or self.text_model
 
     def _chat(self, model: str, user_content) -> dict:
         resp = httpx.post(
@@ -43,16 +44,18 @@ class SetupParser:
             headers={"Authorization": f"Bearer {self.api_key}"},
             json={
                 "model": model,
-                "max_tokens": 300,
+                # high limit: reasoning models spend tokens "thinking" before answering
+                "max_tokens": 1500,
                 "messages": [
                     {"role": "system", "content": _SYSTEM},
                     {"role": "user", "content": user_content},
                 ],
             },
-            timeout=60,
+            timeout=120,
         )
         resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"].strip()
+        message = resp.json()["choices"][0]["message"]
+        text = (message.get("content") or "").strip()
         return self._extract_json(text)
 
     def parse_text(self, description: str) -> dict:
@@ -69,9 +72,20 @@ class SetupParser:
 
     @staticmethod
     def _extract_json(text: str) -> dict:
-        text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return {"pattern": "double_bottom", "confidence": 0.3,
-                    "notes": f"Could not parse model output: {text[:200]}"}
+        # Models sometimes wrap JSON in prose or code fences, so grab the first {...} block
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+                if data.get("pattern") in KNOWN_PATTERNS:
+                    return data
+            except json.JSONDecodeError:
+                pass
+        # Fallback: look for a known pattern name anywhere in the reply
+        lowered = text.lower()
+        for p in KNOWN_PATTERNS:
+            if p in lowered:
+                return {"pattern": p, "confidence": 0.4,
+                        "notes": "Pattern name found in free-text reply"}
+        return {"pattern": None, "confidence": 0,
+                "notes": f"Could not parse model output: {text[:200]}"}
