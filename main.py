@@ -8,8 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
 from setup_parser import SetupParser, KNOWN_PATTERNS, VisionUnavailable
-from scanner import scan_pairs, DEFAULT_PAIRS
+from scanner import scan_pairs, DEFAULT_PAIRS, DEFAULT_TIMEFRAMES
 from pattern_engine import DETECTORS
+from data_provider import get_default_provider
 
 app = FastAPI(title="Forex Setup Scanner")
 
@@ -23,14 +24,37 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "known_patterns": KNOWN_PATTERNS, "default_pairs": DEFAULT_PAIRS}
+    return {
+        "status": "ok",
+        "known_patterns": KNOWN_PATTERNS,
+        "default_pairs": DEFAULT_PAIRS,
+        "default_timeframes": DEFAULT_TIMEFRAMES,
+    }
+
+
+@app.get("/test-data")
+async def test_data(pair: str = "EUR/USD", interval: str = "1h"):
+    """Quick check that the market data key and provider work."""
+    try:
+        provider = get_default_provider()
+        df = await provider.get_candles(pair, interval=interval, output_size=50)
+        return {
+            "ok": True,
+            "pair": pair,
+            "candles": len(df),
+            "last_close": float(df["close"].iloc[-1]),
+            "last_time": str(df.index[-1]),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/scan")
 async def scan(
     description: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
-    pairs: Optional[str] = Form(None),   # comma separated, optional override
+    pairs: Optional[str] = Form(None),        # comma separated, e.g. "EUR/USD,GBP/USD"
+    timeframes: Optional[str] = Form(None),   # comma separated, e.g. "1h,4h"
     min_score: float = Form(40.0),
 ):
     """
@@ -47,7 +71,7 @@ async def scan(
         raise HTTPException(500, str(e))
 
     try:
-        if image is not None:
+        if image is not None and image.filename:
             image_bytes = await image.read()
             try:
                 parsed = parser.parse_image(
@@ -64,6 +88,8 @@ async def scan(
                         "Image analysis isn't enabled. Describe the setup in text instead.",
                     )
         else:
+            if not description:
+                raise HTTPException(400, "Provide a text description or an image.")
             parsed = parser.parse_text(description)
     except HTTPException:
         raise
@@ -74,13 +100,16 @@ async def scan(
     if pattern_key not in DETECTORS:
         raise HTTPException(
             422,
-            f"Could not map your input to a known pattern. Try naming one, e.g. "
+            "Could not map your input to a known pattern. Try naming one, e.g. "
             f"'double bottom' or 'bull flag'. Model said: {parsed.get('notes')}",
         )
 
-    pair_list = [p.strip() for p in pairs.split(",")] if pairs else None
+    pair_list = [p.strip() for p in pairs.split(",") if p.strip()] if pairs else None
+    tf_list = [t.strip() for t in timeframes.split(",") if t.strip()] if timeframes else None
+
     try:
-        results = await scan_pairs(pattern_key, pairs=pair_list, min_score=min_score)
+        result = await scan_pairs(pattern_key, pairs=pair_list, timeframes=tf_list,
+                                  min_score=min_score)
     except Exception as e:
         raise HTTPException(502, f"Market data fetch failed: {e}")
 
@@ -88,6 +117,9 @@ async def scan(
         "interpreted_pattern": pattern_key,
         "interpretation_confidence": parsed.get("confidence"),
         "interpretation_notes": parsed.get("notes"),
-        "matches": results,
-        "count": len(results),
+        "scanned": result["scanned"],
+        "failed": result["failed"],
+        "errors": result["errors"],
+        "count": len(result["hits"]),
+        "matches": result["hits"],
     }
