@@ -29,6 +29,14 @@ MAX_PER_MINUTE = 7
 _calls: deque[float] = deque()
 _limiter_lock = asyncio.Lock()
 
+# Detectors that find several variants (e.g. bull AND bear flags).
+# If the user asked for one specific variant, drop the others.
+SPECIFIC_VARIANTS = {
+    "bull_flag", "bear_flag",
+    "ascending_triangle", "descending_triangle", "symmetrical_triangle",
+    "resistance_breakout", "support_breakdown",
+}
+
 
 async def _wait_for_slot() -> None:
     """Block until a request is allowed under the per-minute limit."""
@@ -90,6 +98,11 @@ async def scan_pairs(pattern_key: str, pairs: list[str] | None = None,
             errors.append(f"{pair} {tf}: only {len(df)} candles returned")
             return None
         match: PatternMatch = detector(df)
+
+        # Asked for a bull flag but the detector found a bear flag? Skip it.
+        if pattern_key in SPECIFIC_VARIANTS and match.pattern != pattern_key:
+            return None
+
         if match.score < min_score:
             return None
         result = asdict(match)
