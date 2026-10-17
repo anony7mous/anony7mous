@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections import deque
 from dataclasses import asdict
 
 import pandas as pd
@@ -10,20 +11,36 @@ import pandas as pd
 from data_provider import get_default_provider
 from pattern_engine import DETECTORS, PatternMatch
 
+# 7 pairs so a full scan fits inside the free plan's 8 requests per minute.
+# Pass your own `pairs` (or set SCAN_PAIRS in Render) to scan others;
+# extra pairs just make the scan wait for the next minute window.
 DEFAULT_PAIRS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD",
-    "USD/CHF", "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY",
-    "AUD/JPY", "EUR/AUD",
+    "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD",
+    "USD/CAD", "USD/CHF", "EUR/JPY",
 ]
 
-# One timeframe by default keeps a scan to 12 data requests.
-# Free data plans limit requests per minute, so scanning many
-# timeframes at once can trigger rate-limit errors.
 DEFAULT_TIMEFRAMES = ["4h"]
 
 CACHE_TTL_SECONDS = 600
 _cache: dict[tuple[str, str], tuple[float, pd.DataFrame]] = {}
-_semaphore = asyncio.Semaphore(3)  # at most 3 data requests at once
+
+# Stay under the free plan limit of 8 requests per minute
+MAX_PER_MINUTE = 7
+_calls: deque[float] = deque()
+_limiter_lock = asyncio.Lock()
+
+
+async def _wait_for_slot() -> None:
+    """Block until a request is allowed under the per-minute limit."""
+    async with _limiter_lock:
+        while True:
+            now = time.monotonic()
+            while _calls and now - _calls[0] >= 61:
+                _calls.popleft()
+            if len(_calls) < MAX_PER_MINUTE:
+                _calls.append(now)
+                return
+            await asyncio.sleep(61 - (now - _calls[0]) + 0.1)
 
 
 async def _get_candles(provider, pair: str, tf: str) -> pd.DataFrame:
@@ -31,10 +48,21 @@ async def _get_candles(provider, pair: str, tf: str) -> pd.DataFrame:
     cached = _cache.get(key)
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
         return cached[1]
-    async with _semaphore:
-        df = await provider.get_candles(pair, interval=tf, output_size=200)
-    _cache[key] = (time.time(), df)
-    return df
+
+    last_error: Exception | None = None
+    for attempt in range(3):
+        await _wait_for_slot()
+        try:
+            df = await provider.get_candles(pair, interval=tf, output_size=200)
+            _cache[key] = (time.time(), df)
+            return df
+        except Exception as e:
+            last_error = e
+            if "API credits" in str(e) or "rate" in str(e).lower():
+                await asyncio.sleep(20)  # rate limited: wait, then retry
+                continue
+            raise
+    raise last_error  # type: ignore[misc]
 
 
 async def scan_pairs(pattern_key: str, pairs: list[str] | None = None,
