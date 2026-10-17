@@ -7,7 +7,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
-from setup_parser import SetupParser, KNOWN_PATTERNS
+from setup_parser import SetupParser, KNOWN_PATTERNS, VisionUnavailable
 from scanner import scan_pairs, DEFAULT_PAIRS
 from pattern_engine import DETECTORS
 
@@ -15,7 +15,7 @@ app = FastAPI(title="Forex Setup Scanner")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten before shipping to prod
+    allow_origins=["*"],  # tighten to your frontend URL before sharing publicly
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -36,30 +36,53 @@ async def scan(
     """
     Accepts a text description and/or a chart image describing the setup.
     Returns the pairs/timeframes currently forming or near that setup,
-    ranked by how far along the pattern is (near_complete/complete first)
-    and by confidence.
+    ranked by how far along the pattern is and by confidence.
     """
     if not description and not image:
         raise HTTPException(400, "Provide a text description, an image, or both.")
 
-    parser = SetupParser()
+    try:
+        parser = SetupParser()
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
 
-    if image is not None:
-        image_bytes = await image.read()
-        parsed = parser.parse_image(
-            image_bytes,
-            media_type=image.content_type or "image/png",
-            extra_text=description,
-        )
-    else:
-        parsed = parser.parse_text(description)
+    try:
+        if image is not None:
+            image_bytes = await image.read()
+            try:
+                parsed = parser.parse_image(
+                    image_bytes,
+                    media_type=image.content_type or "image/png",
+                    extra_text=description,
+                )
+            except VisionUnavailable:
+                if description:
+                    parsed = parser.parse_text(description)
+                else:
+                    raise HTTPException(
+                        400,
+                        "Image analysis isn't enabled. Describe the setup in text instead.",
+                    )
+        else:
+            parsed = parser.parse_text(description)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"The AI model request failed: {e}")
 
     pattern_key = parsed.get("pattern")
     if pattern_key not in DETECTORS:
-        raise HTTPException(422, f"Could not map input to a known pattern. Model said: {parsed}")
+        raise HTTPException(
+            422,
+            f"Could not map your input to a known pattern. Try naming one, e.g. "
+            f"'double bottom' or 'bull flag'. Model said: {parsed.get('notes')}",
+        )
 
     pair_list = [p.strip() for p in pairs.split(",")] if pairs else None
-    results = await scan_pairs(pattern_key, pairs=pair_list, min_score=min_score)
+    try:
+        results = await scan_pairs(pattern_key, pairs=pair_list, min_score=min_score)
+    except Exception as e:
+        raise HTTPException(502, f"Market data fetch failed: {e}")
 
     return {
         "interpreted_pattern": pattern_key,
